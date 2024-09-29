@@ -13,7 +13,7 @@ export * from "./types.js";
 export function isJsonRpcRequest(req: any): req is JsonRpcRequest {
   if (req.jsonrpc !== "2.0") return false;
   if (typeof req.method !== "string") return false;
-  if (!Array.isArray(req.params)) return false;
+  if (!Array.isArray(req.params) && req.params !== undefined) return false;
   return true;
 }
 
@@ -83,7 +83,7 @@ export type JsonValue =
 /**
  * Signature that all RPC methods must adhere to.
  */
-export type RpcMethod<V = JsonValue> = (...args: any[]) => V | Promise<V>;
+export type RpcMethod<V = JsonValue> = (...args: any[]) => V | Promise<V> | void;
 
 /**
  * Conditional type to verify a given type is a valid RPC method.
@@ -122,6 +122,7 @@ export async function handleRpc<T extends RpcService<T, V>, V = JsonValue>(
   const req = options?.transcoder?.deserialize(request) ?? request;
   const id = getRequestId(req);
   const res = (data: any) => {
+    if (id === null || id === undefined) return; // Notifications don't have an id
     const raw = {
       jsonrpc: "2.0",
       id,
@@ -141,7 +142,7 @@ export async function handleRpc<T extends RpcService<T, V>, V = JsonValue>(
     });
   }
   try {
-    const result = await service[method as keyof T](...params);
+    const result = await service[method as keyof T](...params ?? []);
     return res({ result });
   } catch (err) {
     if (options?.onError) {

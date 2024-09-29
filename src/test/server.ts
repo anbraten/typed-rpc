@@ -18,7 +18,7 @@ app.use("/api", (req, res, next) => {
 
 app.post("/api", (req, res, next) => {
   handleRpc(req.body, service)
-    .then((result) => res.json(result))
+    .then((result) => result ? res.json(result) : res.end())
     .catch(next);
 });
 

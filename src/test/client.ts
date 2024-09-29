@@ -1,5 +1,5 @@
 import "isomorphic-fetch";
-import { serialize, deserialize } from "superjson";
+import superjson from "superjson";
 import tap from "tap";
 import { rpcClient, RpcError } from "../client.js";
 import type { Service } from "./service.js";
@@ -83,7 +83,7 @@ tap.test("should use custom error message if configured", async (t) => {
 tap.test("should support custom transcoders", async (t) => {
   const client = rpcClient<ComplexService>({
     url: process.env.SERVER_URL + "/complex-api",
-    transcoder: { serialize, deserialize },
+    transcoder: { serialize: superjson.stringify, deserialize: superjson.parse },
   });
   const date = await client.startOfEpoch();
   t.type(date, Date);
@@ -115,4 +115,35 @@ tap.test("should not relay internal methods", async (t) => {
   client.toString();
   //@ts-expect-error
   client[Symbol()];
+});
+
+tap.test("should send notification", async (t) => {
+  let called = false;
+  const client = rpcClient<Service>({
+    url: 'n/a',
+    transport: async (_req) => {
+      const req = JSON.parse(_req);
+      if (req.method === "ping") {
+        called = true;
+      }
+    },
+  });
+  await client.$notify("ping", [Date.now()]);
+  t.equal(called, true);
+});
+
+tap.test("should send request", async (t) => {
+  const client = rpcClient<Service>({
+    url: 'n/a',
+    transport: async (_req) => {
+      const req = JSON.parse(_req);
+      return JSON.stringify({
+        jsonrpc: "2.0",
+        result: `Hello, ${req.params![0]}!`,
+        id: req.id,
+      });
+    },
+  });
+  const res = await client.$request("hello", ["Alice"]);
+  t.equal(res, `Hello, Alice!`);
 });
