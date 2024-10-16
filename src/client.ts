@@ -1,10 +1,44 @@
-import type {
-  JsonRpcRequest,
-  JsonRpcResponse,
-  RpcTranscoder,
+import {
+  type JsonRpcErrorResponse,
+  type JsonRpcRequest,
+  type JsonRpcResponse,
+  type RpcTranscoder,
 } from "./types.js";
 
 export * from "./types.js";
+
+/**
+ * Type guard to check if a given object is a valid JSON-RPC response.
+ */
+export function isJsonRpcResponse(res: unknown): res is JsonRpcResponse {
+  if (typeof res !== "object" || res === null) return false;
+  if (!("jsonrpc" in res) || res.jsonrpc !== "2.0") return false;
+  if (
+    !("id" in res) ||
+    (typeof res.id !== "string" &&
+      typeof res.id !== "number" &&
+      res.id !== null)
+  )
+    return false;
+
+  if ("result" in res) {
+    // Check for JsonRpcSuccessResponse
+    return !("error" in res);
+  } else if ("error" in res) {
+    // Check for JsonRpcErrorResponse
+    const error = (res as JsonRpcErrorResponse).error;
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      typeof error.code === "number" &&
+      "message" in error &&
+      typeof error.message === "string"
+    );
+  }
+
+  return false;
+}
 
 /**
  * Error class that is thrown if a remote method returns an error.
@@ -34,13 +68,13 @@ export type RpcTransport = (
 
 type RpcClientOptions =
   | string
-  | (FetchOptions & {
-      transport?: RpcTransport;
+  | ((FetchOptions | { transport: RpcTransport }) & {
       transcoder?: RpcTranscoder<any>;
     });
 
 type FetchOptions = {
   url: string;
+  transport?: never;
   credentials?: RequestCredentials;
   getHeaders?():
     | Record<string, string>
@@ -64,11 +98,20 @@ const identityTranscoder: RpcTranscoder<any> = {
 };
 
 export function rpcClient<T extends object>(options: RpcClientOptions) {
+  let transport: RpcTransport;
+  let transcoder: RpcTranscoder<any> = identityTranscoder;
+
   if (typeof options === "string") {
-    options = { url: options };
+    transport = fetchTransport({ url: options });
+  } else if ("transport" in options && options.transport) {
+    transport = options.transport;
+    transcoder = options.transcoder || identityTranscoder;
+  } else {
+    transport = fetchTransport(options);
+    transcoder = options.transcoder || identityTranscoder;
   }
-  const transport = options.transport || fetchTransport(options);
-  const { serialize, deserialize } = options.transcoder || identityTranscoder;
+
+  const { serialize, deserialize } = transcoder;
 
   /**
    * Send a request using the configured transport and handle the result.
@@ -80,21 +123,16 @@ export function rpcClient<T extends object>(options: RpcClientOptions) {
   ) => {
     const req = createRequest(method, args);
     const raw = await transport(serialize(req as any), signal);
-    const res = deserialize(raw);
-    if (res?.jsonrpc !== "2.0") {
+    const res: unknown = deserialize(raw);
+    if (!isJsonRpcResponse(res)) {
       throw new TypeError("Not a JSON-RPC 2.0 response");
     }
-
     if ("error" in res) {
       const { code, message, data } = res.error;
       throw new RpcError(message, code, data);
-    }
-
-    if ("result" in res) {
+    } else {
       return res.result;
     }
-
-    throw new TypeError("Invalid response");
   };
 
   // Map of AbortControllers to abort pending requests
@@ -134,13 +172,15 @@ export function rpcClient<T extends object>(options: RpcClientOptions) {
   }) as typeof target & PromisifyMethods<T>;
 }
 
+let id = 1;
+
 /**
  * Create a JsonRpcRequest for the given method.
  */
 export function createRequest(method: string, params?: any[]): JsonRpcRequest {
   const req: JsonRpcRequest = {
     jsonrpc: "2.0",
-    id: Date.now(),
+    id: id++,
     method,
   };
 
@@ -182,131 +222,5 @@ export function fetchTransport(options: FetchOptions): RpcTransport {
       throw new RpcError(res.statusText, res.status);
     }
     return await res.json();
-  };
-}
-
-export type WebSocketTransportOptions = {
-  /**
-   * The URL to connect to.
-   */
-  url: string;
-  /**
-   * Reconnection timeout in milliseconds. Default is 1000ms.
-   * Set to 0 to disable reconnection.
-   */
-  reconnectTimeout?: number;
-  /**
-   * The timeout in milliseconds for requests.
-   * Default is 60_000ms.
-   */
-  timeout?: number;
-  /**
-   * Error handler for incoming messages.
-   */
-  onMessageError?: (err: unknown) => void;
-  /**
-   * WebSocket open handler.
-   * Use to access the WebSocket instance.
-   */
-  onOpen?: (ev: Event, ws: WebSocket) => void;
-};
-
-export function websocketTransport(
-  options: WebSocketTransportOptions
-): RpcTransport {
-  type Request = {
-    resolve: Function;
-    reject: Function;
-    timeoutId?: ReturnType<typeof setTimeout>;
-  };
-  const requests = new Map<string | number, Request>();
-  const timeout = options.timeout ?? 60_000;
-
-  let ws: WebSocket;
-  function connect() {
-    ws = new WebSocket(options.url.replace("http", "ws"));
-
-    ws.addEventListener("open", (e) => {
-      options.onOpen?.(e, ws);
-    });
-
-    ws.addEventListener("message", (e) => {
-      const raw = e.data.toString();
-      const res = JSON.parse(raw) as JsonRpcResponse;
-      if (typeof res.id !== "string" && typeof res.id !== "number") {
-        options.onMessageError?.(
-          new TypeError("Invalid response (missing id)")
-        );
-        return;
-      }
-
-      const request = requests.get(res.id);
-      if (!request) {
-        options.onMessageError?.(
-          new Error("Request not found for id: " + res.id)
-        );
-        return;
-      }
-
-      requests.delete(res.id);
-      if (request.timeoutId) {
-        clearTimeout(request.timeoutId);
-      }
-
-      request.resolve(raw);
-    });
-
-    ws.addEventListener("close", (e) => {
-      const reconnectTimeout = options.reconnectTimeout ?? 1000;
-      if (reconnectTimeout !== 0 && !e.wasClean) {
-        setTimeout(connect, reconnectTimeout);
-      }
-    });
-
-    ws.addEventListener("error", () => {
-      ws.close();
-    });
-  }
-
-  connect();
-
-  return async (req, signal): Promise<any> => {
-    const _req: JsonRpcRequest =
-      typeof req === "string" ? JSON.parse(req) : req;
-
-    if (typeof _req.id !== "string" && typeof _req.id !== "number") {
-      // skip notifications
-      return;
-    }
-
-    const requestId = _req.id;
-
-    if (requests.has(requestId)) {
-      throw new RpcError("Request already exists", -32000);
-    }
-
-    const res = await new Promise((resolve, reject) => {
-      const request: Request = { resolve, reject };
-
-      if (timeout > 0) {
-        request.timeoutId = setTimeout(() => {
-          reject(new RpcError("Request timed out", -32000));
-        }, timeout);
-      }
-
-      signal.onabort = () => {
-        if (request.timeoutId) {
-          clearTimeout(request.timeoutId);
-        }
-        reject(new RpcError("Request aborted", -32000));
-      };
-
-      requests.set(requestId, request);
-
-      console.log("sending", req);
-      ws.send(req as any);
-    });
-
-    return res;
   };
 }
